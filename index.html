@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#2f65f1">
+<title>OKEN preview</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; font-family: system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", sans-serif; color: #15171c; background: #2f65f1; }
+  .card { width: min(400px, 100%); padding: 32px 28px 26px; background: #fff; box-shadow: -14px 14px 0 #2450cf; }
+  .en { margin: 0 0 6px; font-size: 12px; font-weight: 800; letter-spacing: 0.16em; color: #2f65f1; }
+  h1 { margin: 0 0 8px; font-size: 24px; font-weight: 700; letter-spacing: 0.04em; }
+  p { margin: 0 0 18px; font-size: 14px; line-height: 1.7; color: #404044; }
+  label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 700; }
+  input[type=password] { width: 100%; min-height: 48px; padding: 10px 14px; border: 2px solid #15171c; background: #fff; color: #15171c; font-size: 16px; }
+  .remember { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; font-size: 13px; font-weight: 500; }
+  button { width: 100%; min-height: 50px; border: 0; background: #2f65f1; color: #fff; font-size: 16px; font-weight: 700; letter-spacing: 0.08em; cursor: pointer; }
+  button:hover { background: #2450cf; }
+  button:disabled { opacity: 0.6; cursor: default; }
+  :focus-visible { outline: 3px solid #ffe14a; outline-offset: 3px; }
+  #msg { min-height: 1.6em; margin: 14px 0 0; font-size: 13px; }
+  #msg.err { color: #c62828; font-weight: 700; }
+  .note { margin: 18px 0 0; font-size: 11px; color: #5b6170; }
+  .note a { color: inherit; }
+</style>
+</head>
+<body>
+<main class="card">
+  <p class="en">OKEN RENEWAL PREVIEW</p>
+  <h1>応用光研工業 リニューアル案</h1>
+  <p>このページはパスワードで保護されています。</p>
+  <form id="lockForm">
+    <label for="lockPw">パスワード</label>
+    <input id="lockPw" type="password" autocomplete="current-password" required>
+    <label class="remember"><input id="lockRemember" type="checkbox"> この端末で覚えておく</label>
+    <button id="lockBtn" type="submit">ひらく</button>
+    <p id="msg" role="status" aria-live="polite"></p>
+  </form>
+  <p class="note">「覚えておく」を付けないときは、30分操作しないと自動で閉じます。共用の端末では付けないでください。記憶を消すときは <a href="?logout">こちら</a>。</p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const KDF = {"salt":"AKm3cTcYiNTRdIkE2DhrCQ==","iterations":600000};
+  const VERSION = "572d774a69e93045";
+  const PREFIX = "oken-proto-";
+  // must match sw.js: an unlock that is not remembered stays open while in use and closes after this much idle time
+  const IDLE_MS = 30 * 60 * 1000;
+  const DB = "oken-proto-lock";
+  const FLAG = "oken-proto-session";
+  const $ = (id) => document.getElementById(id);
+  const msg = (text, isErr) => { $("msg").textContent = text; $("msg").className = isErr ? "err" : ""; };
+  const b64ToBytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const base = new URL(".", location.href);
+  class WrongPassword extends Error {}
+
+  // ---- the session the service worker reads (keys, version, how long it stays open) ----
+  const idb = () => new Promise((resolve, reject) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("s");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+  const readSession = async () => {
+    try {
+      const db = await idb();
+      return await new Promise((resolve) => { const q = db.transaction("s").objectStore("s").get("session"); q.onsuccess = () => resolve(q.result || null); q.onerror = () => resolve(null); });
+    } catch { return null; }
+  };
+  const writeSession = async (s) => {
+    const db = await idb();
+    await new Promise((resolve, reject) => {
+      const t = db.transaction("s", "readwrite");
+      if (s) t.objectStore("s").put(s, "session"); else t.objectStore("s").delete("session");
+      t.oncomplete = () => resolve();
+      t.onerror = () => reject(t.error);
+    });
+  };
+  const clearAll = async () => {
+    for (const k of await caches.keys()) if (k.startsWith(PREFIX)) await caches.delete(k);
+    try { await writeSession(null); } catch { /* storage blocked */ }
+  };
+
+  // the small check file: whether the password is right, without fetching the site
+  let checkPromise = null;
+  const loadCheck = () => {
+    if (!checkPromise) {
+      checkPromise = fetch(new URL("check.bin?v=" + VERSION, base)).then((r) => { if (!r.ok) throw new Error("check " + r.status); return r.arrayBuffer(); });
+      checkPromise.catch(() => { checkPromise = null; });
+    }
+    return checkPromise;
+  };
+
+  async function secretFor(password) {
+    const pw = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+    return crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64ToBytes(KDF.salt), iterations: KDF.iterations }, pw, 256);
+  }
+
+  async function unlock(password, keep) {
+    const box = new Uint8Array(await loadCheck());
+    const raw = await secretFor(password);
+    const encKey = await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+    try {
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv: box.subarray(0, 12) }, encKey, box.subarray(12));
+    } catch {
+      throw new WrongPassword();
+    }
+    await clearAll();
+    // stored as plain bytes: every browser can hand these to the service worker (a stored CryptoKey fails on some)
+    await writeSession({ raw, version: VERSION, keep: !!keep, until: keep ? 0 : Date.now() + IDLE_MS });
+  }
+
+  // Go in only once THIS version's service worker answers: a device that opened the older preview still has the
+  // old worker, which would send the visitor straight back here.
+  async function workerReady(reg) {
+    const until = Date.now() + 15000;
+    const ask = (worker) => new Promise((resolve) => {
+      if (!worker) return resolve(false);
+      const ch = new MessageChannel();
+      const t = setTimeout(() => resolve(false), 600); // an older worker never answers
+      ch.port1.onmessage = (e) => { clearTimeout(t); resolve(e.data === "oken-sw-2"); };
+      worker.postMessage("oken-sw?", [ch.port2]);
+    });
+    while (Date.now() < until) {
+      if (reg.active && reg.active.state === "activated" && !reg.waiting && !reg.installing && (await ask(reg.active))) return true;
+      try { await reg.update(); } catch { /* offline */ }
+      await new Promise((res) => setTimeout(res, 300));
+    }
+    return false;
+  }
+  // if the site keeps sending this tab back here, stop instead of bouncing, and say what to do
+  const BOUNCE = "oken-proto-bounce";
+  const bounced = () => {
+    try {
+      const t = Number(sessionStorage.getItem(BOUNCE) || 0);
+      return Date.now() - t < 8000;
+    } catch { return false; }
+  };
+  const markGoing = () => { try { sessionStorage.setItem(BOUNCE, String(Date.now())); } catch { /* storage blocked */ } };
+  async function goIn(reg) {
+    if (!(await workerReady(reg))) {
+      msg("ひらけませんでした。ページを再読み込みしてから、もう一度パスワードを入れてください。", true);
+      return false;
+    }
+    markGoing();
+    location.replace(new URL("app/", base).href);
+    return true;
+  }
+
+  const setFlag = (keep) => {
+    try {
+      if (keep) localStorage.setItem(FLAG, "keep");
+      else { localStorage.removeItem(FLAG); sessionStorage.setItem(FLAG, "open"); }
+    } catch { /* storage blocked */ }
+  };
+  const hasFlag = () => {
+    try { return localStorage.getItem(FLAG) === "keep" || sessionStorage.getItem(FLAG) === "open"; } catch { return false; }
+  };
+  const clearFlag = () => {
+    try { localStorage.removeItem(FLAG); sessionStorage.removeItem(FLAG); } catch { /* storage blocked */ }
+  };
+
+  async function start() {
+    // until the screen is ready (on a slow line that takes a moment) the form must not reload the page
+    $("lockForm").addEventListener("submit", (e) => e.preventDefault());
+    $("lockBtn").disabled = true;
+    if (!("serviceWorker" in navigator) || !window.caches || !window.indexedDB || !window.crypto || !crypto.subtle || typeof DecompressionStream === "undefined") {
+      msg("このブラウザーでは開けません。新しい Chrome・Edge・Safari で開いてください。", true);
+      $("lockBtn").disabled = true;
+      return;
+    }
+    // updateViaCache "none": always fetch sw.js fresh, so a device that opened an older preview gets the new worker
+    const ready = navigator.serviceWorker.register(new URL("sw.js", base), { updateViaCache: "none" }).then(() => navigator.serviceWorker.ready);
+    ready.catch(() => {});
+    const params = new URLSearchParams(location.search);
+    // this password screen may be an old copy kept by the browser: if a newer version is published, load the new screen
+    try {
+      const r = await fetch(new URL("version.json", base), { cache: "no-store" });
+      const latest = r.ok ? (await r.json()).id : null;
+      if (latest && latest !== VERSION && params.get("v") !== latest) {
+        location.replace(base.pathname + "?v=" + latest + (params.has("logout") ? "&logout" : "") + (params.get("from") ? "&from=" + encodeURIComponent(params.get("from")) : ""));
+        return;
+      }
+    } catch { /* offline: carry on with this copy */ }
+    if (params.has("logout")) {
+      await clearAll();
+      clearFlag();
+      history.replaceState(null, "", base.pathname);
+      msg("この端末の記憶を消しました。");
+    } else {
+      // already open on this device (remembered, or still within this browsing session): straight in. After an
+      // update the same keys still work, so no new password is needed unless the password itself was changed.
+      const s = await readSession();
+      if (s && s.raw && hasFlag() && (s.keep === true || Date.now() < s.until) && !bounced()) {
+        msg("ひらいています…");
+        if (await goIn(await ready)) return;
+      }
+      if (bounced()) {
+        // sent straight back from the site: say so, with the worker's reason in small print for troubleshooting
+        const why = params.get("from");
+        msg("ひらけませんでした。もう一度パスワードを入れてください。" + (why ? "（" + why + "）" : ""), true);
+      }
+      await clearAll();
+    }
+    loadCheck().catch(() => {});
+    $("lockBtn").disabled = false;
+    if (matchMedia("(hover: hover)").matches) $("lockPw").focus();
+    $("lockForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const password = $("lockPw").value;
+      if (!password) return;
+      $("lockBtn").disabled = true;
+      msg("確かめています…");
+      try {
+        const keep = $("lockRemember").checked;
+        await unlock(password, keep);
+        setFlag(keep);
+        $("lockPw").value = "";
+        msg("ひらいています…");
+        if (!(await goIn(await ready))) $("lockBtn").disabled = false;
+      } catch (err) {
+        msg(err instanceof WrongPassword ? "パスワードが違います。" : "読み込めませんでした。インターネットにつながっているか確かめて、再読み込みしてください。", true);
+        $("lockBtn").disabled = false;
+        $("lockPw").select();
+      }
+    });
+  }
+  start();
+})();
+</script>
+</body>
+</html>
